@@ -60,13 +60,14 @@ def _convert_content_segments(segments: list) -> list:
                 },
             })
         elif t in ("image", "video", "record"):
-            # 媒体段：get_forward_msg 返回的 file 是文件名，需替换为可下载 URL
             d = dict(seg.get("data", {}))
             url = d.get("url", "")
             if url and url.startswith("http"):
-                d["file"] = url  # NapCat send 格式要求 file 为 URL
+                d["file"] = url
             out.append({"type": t, "data": d})
         else:
+            # text / face / at / markdown / reply 等直接保留
+            logger.debug(f"[GroupWelcome] convert passthrough segment type={t}")
             out.append(copy.deepcopy(seg))
     return out
 
@@ -261,13 +262,15 @@ class GroupWelcomePlugin(Star):
             return
         try:
             messages = _convert_raw_to_send_format(raw_msgs)
+            logger.info(f"[GroupWelcome] 准备发送 {len(messages)} 条消息，首条 sample: {str(messages[0])[:300] if messages else 'empty'}")
             try:
                 await bot.call_action("send_private_forward_msg", user_id=user_id, group_id=group_id, messages=messages)
             except Exception:
                 await bot.call_action("send_private_forward_msg", user_id=user_id, messages=messages)
             logger.info(f"[GroupWelcome] 合并转发已发送 -> {user_id}")
         except Exception as e:
-            logger.error(f"[GroupWelcome] 发送合并转发失败: {e}")
+            import traceback
+            logger.error(f"[GroupWelcome] 发送合并转发失败: {e}\n{traceback.format_exc()}")
 
     async def _send_group_card(self, bot, user_id: str, group_id: str, wc: dict):
         try:
