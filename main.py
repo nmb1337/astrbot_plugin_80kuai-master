@@ -560,10 +560,14 @@ class GroupWelcomePlugin(Star):
                 elif seg_type == "forward":
                     # ── 嵌套转发：尝试立即解析，展开子消息到当前层级 ──
                     fid = seg_data.get("id", "")
+                    # 调试：打印 data 的全部 key，检查是否有内联内容
+                    logger.info(
+                        f"[GroupWelcome] 嵌套转发 id={fid}, "
+                        f"data_keys={list(seg_data.keys())}, "
+                        f"depth={depth}"
+                    )
+                    resolved = False
                     if fid and bot:
-                        logger.info(
-                            f"[GroupWelcome] 尝试解析嵌套转发 id={fid} (depth={depth})"
-                        )
                         try:
                             inner_ret = await bot.call_action(
                                 "get_forward_msg", message_id=str(fid)
@@ -572,20 +576,15 @@ class GroupWelcomePlugin(Star):
                                 inner_nodes = await GroupWelcomePlugin._parse_forward_api_response(
                                     inner_ret["messages"], bot=bot, depth=depth + 1
                                 )
-                                # 将内层消息展开到当前层级（不嵌套，直接平铺）
                                 nodes.extend(inner_nodes)
-                        except Exception as e:
-                            # NapCat 对内层转发返回 retcode=1200，无法解析，静默跳过
-                            logger.warning(
-                                f"[GroupWelcome] 嵌套转发 id={fid} 无法解析（内层消息），已跳过"
-                            )
-                            logger.debug(f"[GroupWelcome] 详情: {e}")
-                    elif fid:
-                        # 无 bot 引用，无法解析，跳过
+                                resolved = True
+                        except Exception:
+                            pass  # NapCat retcode=1200，内层消息无法单独获取
+                    if not resolved:
                         logger.warning(
-                            f"[GroupWelcome] 无 bot 无法解析嵌套转发 id={fid}，已跳过"
+                            f"[GroupWelcome] 嵌套转发 id={fid} 无法解析（NapCat 不支持内层消息），"
+                            f"data_keys={list(seg_data.keys())}，已跳过"
                         )
-                    # 注意：无论成功与否，都不添加占位文字到 content
 
                 elif seg_type == "node":
                     # ── 内联 node：递归解析其 content ──
