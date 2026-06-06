@@ -122,11 +122,25 @@ class GroupWelcomePlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_set_forward(self, event: AstrMessageEvent):
         """捕获引用消息中的合并转发聊天记录并保存"""
+        # 先给用户一个反馈，避免长时间等待
+        yield event.plain_result("🔍 正在解析合并转发消息，请稍候...")
+
         nodes = await self._extract_forward_nodes(event)
         if not nodes:
+            # 输出诊断信息帮助用户排查
+            msgs = event.get_messages()
+            comp_types = [type(c).__name__ for c in msgs]
+            detail = "\n".join(
+                f"  [{i}] {type(c).__name__}" for i, c in enumerate(msgs)
+            ) or "  （消息链为空）"
             yield event.plain_result(
-                "❌ 未找到合并转发消息。\n"
-                "请先发送一条 QQ 合并转发聊天记录，然后**引用（回复）**它再发送 /welcome set_forward。"
+                f"❌ 未找到合并转发消息。\n\n"
+                f"当前消息包含的组件类型：\n{detail}\n\n"
+                f"请确保：\n"
+                f"1. 先发送一条 QQ「合并转发」消息到群里\n"
+                f"2. 长按那条消息 → 选择「引用」（回复）\n"
+                f"3. 输入 /welcome set_forward 发送\n\n"
+                f"💡 也可以直接发送 /welcome set_forward 并引用包含合并转发的消息。"
             )
             return
 
@@ -266,42 +280,108 @@ class GroupWelcomePlugin(Star):
     # ══════════════════════════════════════════════════════════════════
 
     async def _extract_forward_nodes(self, event: AstrMessageEvent) -> list[Comp.Node]:
-        """从事件消息中提取合并转发节点。
-        优先级：引用消息 > 当前消息 > Forward ID API 查询
+        """从事件消息中提取合并转发节点。支持多种路径：
+        1. Reply 的 chain 中有 Node/Nodes → 直接提取
+        2. Reply 的 chain 中有 Forward（ID 引用）→ get_forward_msg API
+        3. Reply.chain 为空 → 用 Reply.id 调 get_msg → 找 Forward → get_forward_msg
+        4. 当前消息中有 Node/Nodes → 直接提取
+        5. 当前消息中有 Forward → get_forward_msg API
         """
         from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
             AiocqhttpMessageEvent,
         )
 
-        # 1. 先从引用消息中提取
-        for comp in event.get_messages():
-            if isinstance(comp, Comp.Reply) and comp.chain:
+        bot = event.bot if isinstance(event, AiocqhttpMessageEvent) else None
+        msgs = event.get_messages()
+
+        # 打印调试信息，方便排查
+        comp_types = [type(c).__name__ for c in msgs]
+        logger.info(f"[GroupWelcome] 消息链组件类型: {comp_types}")
+
+        # ── 路径 1 & 2：从引用（Reply）中提取 ─────────────────────
+        for comp in msgs:
+            if not isinstance(comp, Comp.Reply):
+                continue
+
+            logger.info(
+                f"[GroupWelcome] 发现 Reply: id={comp.id}, "
+                f"chain_len={len(comp.chain) if comp.chain else 0}"
+            )
+
+            # 1a. Reply.chain 中存在 → 直接找 Node/Nodes/Forward
+            if comp.chain:
                 nodes = self._find_nodes_in_chain(comp.chain)
                 if nodes:
+                    logger.info(f"[GroupWelcome] 从 Reply.chain 中提取到 {len(nodes)} 个 Node")
                     return nodes
 
-        # 2. 从当前消息中提取
-        nodes = self._find_nodes_in_chain(event.get_messages())
-        if nodes:
-            return nodes
-
-        # 3. 若有 Forward（引用 ID），尝试通过 API 获取
-        if isinstance(event, AiocqhttpMessageEvent):
-            bot = event.bot
-            for comp in event.get_messages():
-                if isinstance(comp, Comp.Forward) and comp.id:
-                    try:
-                        ret = await bot.call_action(
-                            "get_forward_msg",
-                            message_id=str(comp.id),
-                        )
-                        if ret and "messages" in ret:
-                            nodes = self._parse_forward_api_response(ret["messages"])
+                # 1b. Reply.chain 中可能有 Forward 引用
+                if bot:
+                    for c in comp.chain:
+                        if isinstance(c, Comp.Forward) and c.id:
+                            nodes = await self._fetch_forward_by_id(bot, str(c.id))
                             if nodes:
                                 return nodes
-                    except Exception as e:
-                        logger.error(f"[GroupWelcome] 获取转发消息失败: {e}")
 
+            # 1c. Reply.chain 为空 → 用消息 ID 拉取原始消息
+            if bot and comp.id:
+                try:
+                    ret = await bot.call_action("get_msg", message_id=int(comp.id))
+                    logger.info(f"[GroupWelcome] get_msg 返回: {ret}")
+                    if ret and "message" in ret:
+                        raw_msg = ret["message"]
+                        # 原始消息可能是 Forward 类型
+                        if isinstance(raw_msg, list):
+                            for seg in raw_msg:
+                                seg_type = seg.get("type", "")
+                                if seg_type == "forward":
+                                    fid = seg.get("data", {}).get("id", "")
+                                    if fid:
+                                        nodes = await self._fetch_forward_by_id(bot, str(fid))
+                                        if nodes:
+                                            return nodes
+                        # 也可能是 dict 格式
+                        elif isinstance(raw_msg, dict):
+                            seg_type = raw_msg.get("type", "")
+                            if seg_type == "forward":
+                                fid = raw_msg.get("data", {}).get("id", "")
+                                if fid:
+                                    nodes = await self._fetch_forward_by_id(bot, str(fid))
+                                    if nodes:
+                                        return nodes
+                except Exception as e:
+                    logger.error(f"[GroupWelcome] get_msg 失败: {e}")
+
+        # ── 路径 3 & 4：从当前消息中提取 ─────────────────────────
+        nodes = self._find_nodes_in_chain(msgs)
+        if nodes:
+            logger.info(f"[GroupWelcome] 从当前消息中提取到 {len(nodes)} 个 Node")
+            return nodes
+
+        if bot:
+            for comp in msgs:
+                if isinstance(comp, Comp.Forward) and comp.id:
+                    nodes = await self._fetch_forward_by_id(bot, str(comp.id))
+                    if nodes:
+                        return nodes
+
+        # ── 最终未找到，打印完整消息链便于调试 ─────────────────
+        logger.warning("[GroupWelcome] 未能从任何路径提取到合并转发节点")
+        for i, c in enumerate(msgs):
+            logger.info(f"[GroupWelcome]   [{i}] {type(c).__name__}: {c}")
+        return []
+
+    async def _fetch_forward_by_id(self, bot, forward_id: str) -> list[Comp.Node]:
+        """通过 get_forward_msg API 获取合并转发内容"""
+        try:
+            logger.info(f"[GroupWelcome] 尝试 get_forward_msg, id={forward_id}")
+            ret = await bot.call_action("get_forward_msg", message_id=forward_id)
+            if ret and "messages" in ret:
+                nodes = self._parse_forward_api_response(ret["messages"])
+                logger.info(f"[GroupWelcome] get_forward_msg 返回 {len(nodes)} 个 Node")
+                return nodes
+        except Exception as e:
+            logger.error(f"[GroupWelcome] get_forward_msg 失败: {e}")
         return []
 
     @staticmethod
