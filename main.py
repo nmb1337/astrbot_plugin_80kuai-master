@@ -26,7 +26,10 @@ from astrbot.api import logger, AstrBotConfig
 # ── 序列化 / 反序列化工具 ─────────────────────────────────────────────
 
 def _serialize_component(comp) -> dict | None:
-    """将单个消息组件序列化为可 JSON 存储的 dict（嵌套 Node 替换为占位文本）"""
+    """将单个消息组件序列化为可 JSON 存储的 dict。
+    注意：调用前所有嵌套 Node/Nodes 必须已被 _flatten_nodes_deep 展开，
+    因此此处遇到 Node/Nodes/Forward 仅作兜底占位。
+    """
     if isinstance(comp, Comp.Plain):
         return {"type": "plain", "text": comp.text or ""}
     if isinstance(comp, Comp.Image):
@@ -43,12 +46,7 @@ def _serialize_component(comp) -> dict | None:
         return {"type": "face", "id": getattr(comp, "id", 0)}
     if isinstance(comp, Comp.At):
         return {"type": "at", "qq": str(getattr(comp, "qq", ""))}
-    # 嵌套的合并转发节点：替换为占位文本，节点本身由 _flatten_nodes 提取到顶层
-    if isinstance(comp, Comp.Node):
-        return {"type": "plain", "text": "[聊天记录]"}
-    if isinstance(comp, Comp.Nodes):
-        return {"type": "plain", "text": "[聊天记录]"}
-    if isinstance(comp, Comp.Forward):
+    if isinstance(comp, (Comp.Node, Comp.Nodes, Comp.Forward)):
         return {"type": "plain", "text": "[聊天记录]"}
     return {"type": "plain", "text": f"[{type(comp).__name__}]"}
 
@@ -87,20 +85,106 @@ def _serialize_node(node: Comp.Node) -> dict:
     }
 
 
-def _flatten_nodes(nodes: list[Comp.Node]) -> list[Comp.Node]:
-    """将嵌套的 Node 扁平化为单层列表，保持顺序。
-    例如 [A, B[含 C, D], E] → [A, B, C, D, E]
-    其中 B 内的嵌套节点被替换为占位文本。
+async def _flatten_nodes_deep(
+    nodes: list[Comp.Node],
+    bot,
+    depth: int = 0,
+) -> list[Comp.Node]:
+    """递归展开嵌套合并转发，将所有层级的消息平铺为单层 Node 列表。
+
+    规则：
+    - 遍历每个 Node，检查其 content 中是否存在 Comp.Node/Comp.Nodes/Comp.Forward
+    - 若存在嵌套转发：
+        1. 保留当前 Node 中的非转发内容（纯文本/图片/表情等）
+        2. 递归展开嵌套的转发节点 → 得到子节点列表
+        3. 按顺序插入：当前 Node（仅含常规内容）→ 展开的子节点们
+    - 若当前 Node 的 content 全部是嵌套转发（无常规内容），则丢弃该 Node，
+      直接以展开的子节点替代（避免产生空消息）。
+    - 最大递归深度 5 层，防止无限循环。
+
+    返回完全扁平化的 Node 列表，其中任意 Node 的 content 均不含嵌套转发。
     """
-    result = []
+    MAX_DEPTH = 5
+    if depth > MAX_DEPTH:
+        logger.warning("[GroupWelcome] 达到最大嵌套深度，停止展开")
+        return nodes
+
+    result: list[Comp.Node] = []
     for node in nodes:
-        result.append(node)
-        for c in (node.content or []):
-            if isinstance(c, Comp.Node):
-                result.extend(_flatten_nodes([c]))
-            elif isinstance(c, Comp.Nodes):
-                result.extend(_flatten_nodes(c.nodes))
+        regular: list[Comp.BaseMessageComponent] = []
+        nested_nodes: list[Comp.Node] = []
+
+        for comp in (node.content or []):
+            if isinstance(comp, Comp.Node):
+                nested_nodes.append(comp)
+            elif isinstance(comp, Comp.Nodes):
+                nested_nodes.extend(comp.nodes)
+            elif isinstance(comp, Comp.Forward):
+                # 尝试通过 API 解析 Forward ID 引用
+                if bot:
+                    resolved = await _resolve_forward_ref(bot, str(comp.id))
+                    if resolved:
+                        nested_nodes.extend(resolved)
+                    else:
+                        regular.append(Comp.Plain(text="[聊天记录]"))
+                else:
+                    regular.append(Comp.Plain(text="[聊天记录]"))
+            else:
+                regular.append(comp)
+
+        # 递归展开嵌套节点
+        if nested_nodes:
+            expanded = await _flatten_nodes_deep(nested_nodes, bot, depth + 1)
+            if regular:
+                # 当前节点有常规内容 → 保留（去除嵌套转发后的版本）
+                node.content = regular
+                result.append(node)
+            # 展开的嵌套节点跟在后面
+            result.extend(expanded)
+        else:
+            # 无嵌套转发，直接保留
+            result.append(node)
+
     return result
+
+
+async def _resolve_forward_ref(bot, forward_id: str) -> list[Comp.Node]:
+    """通过 get_forward_msg API 解析 Forward ID 为 Node 列表。
+    嵌套 forward 段保留为 Comp.Forward 引用，由 _flatten_nodes_deep 下一轮递归处理。
+    """
+    try:
+        logger.info(f"[GroupWelcome] 解析嵌套转发 id={forward_id}")
+        ret = await bot.call_action("get_forward_msg", message_id=forward_id)
+        if ret and "messages" in ret:
+            nodes = []
+            for msg in ret["messages"]:
+                sender = msg.get("sender", {})
+                uin = str(sender.get("user_id", "0"))
+                name = sender.get("nickname", "")
+                raw = msg.get("message") or msg.get("content") or []
+                content = []
+                for seg in raw:
+                    t = seg.get("type", "")
+                    d = seg.get("data", {})
+                    if t == "text":
+                        content.append(Comp.Plain(text=d.get("text", "")))
+                    elif t == "image":
+                        content.append(
+                            Comp.Image.fromURL(d["url"]) if d.get("url", "").startswith("http")
+                            else Comp.Image.fromFileSystem(d.get("file", ""))
+                        )
+                    elif t == "face":
+                        content.append(Comp.Face(id=d.get("id", 0)))
+                    elif t == "at":
+                        content.append(Comp.At(qq=str(d.get("qq", ""))))
+                    elif t == "forward":
+                        content.append(Comp.Forward(id=str(d.get("id", ""))))
+                if content:
+                    nodes.append(Comp.Node(uin=uin, name=name, content=content))
+            return nodes
+    except Exception as e:
+        logger.error(f"[GroupWelcome] 解析嵌套转发失败 id={forward_id}: {e}")
+    return []
 
 
 def _deserialize_node(data: dict) -> Comp.Node:
@@ -165,8 +249,12 @@ class GroupWelcomePlugin(Star):
             )
             return
 
-        # 扁平化嵌套节点，确保所有节点都在同一层
-        nodes = _flatten_nodes(nodes)
+        # 递归展开嵌套的合并转发，将所有层级消息平铺为单层
+        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+            AiocqhttpMessageEvent,
+        )
+        bot = event.bot if isinstance(event, AiocqhttpMessageEvent) else None
+        nodes = await _flatten_nodes_deep(nodes, bot)
         stored = [_serialize_node(n) for n in nodes]
         wc = self.config.get("welcome_config", {})
         wc["forward_nodes"] = stored
@@ -395,14 +483,12 @@ class GroupWelcomePlugin(Star):
         return []
 
     async def _fetch_forward_by_id(self, bot, forward_id: str) -> list[Comp.Node]:
-        """通过 get_forward_msg API 获取合并转发内容（含嵌套）"""
+        """通过 get_forward_msg API 获取合并转发内容"""
         try:
             logger.info(f"[GroupWelcome] 尝试 get_forward_msg, id={forward_id}")
             ret = await bot.call_action("get_forward_msg", message_id=forward_id)
             if ret and "messages" in ret:
-                nodes = await self._parse_forward_api_response(
-                    ret["messages"], bot=bot
-                )
+                nodes = self._parse_forward_api_response(ret["messages"])
                 logger.info(f"[GroupWelcome] get_forward_msg 返回 {len(nodes)} 个 Node")
                 return nodes
         except Exception as e:
@@ -421,22 +507,17 @@ class GroupWelcomePlugin(Star):
         return nodes
 
     @staticmethod
-    async def _parse_forward_api_response(
-        messages: list,
-        bot=None,
-        depth: int = 0,
-    ) -> list[Comp.Node]:
+    def _parse_forward_api_response(messages: list) -> list[Comp.Node]:
         """将 get_forward_msg API 返回的 messages 列表解析为 Node 列表。
-        支持递归解析嵌套的合并转发（depth 限制最大嵌套层数）。
+        嵌套的 forward 段保留为 Comp.Forward 引用，后续由 _flatten_nodes_deep 统一递归展开。
         """
-        MAX_DEPTH = 3
         nodes = []
         for msg in messages:
             sender = msg.get("sender", {})
             uin = str(sender.get("user_id", "0"))
             name = sender.get("nickname", "")
             raw_content = msg.get("message") or msg.get("content") or []
-            content = []
+            content: list[Comp.BaseMessageComponent] = []
             for seg in raw_content:
                 seg_type = seg.get("type", "")
                 seg_data = seg.get("data", {})
@@ -445,7 +526,7 @@ class GroupWelcomePlugin(Star):
                 elif seg_type == "image":
                     url = seg_data.get("url", "")
                     file = seg_data.get("file", "")
-                    if url:
+                    if url and url.startswith("http"):
                         content.append(Comp.Image.fromURL(url))
                     elif file:
                         content.append(Comp.Image.fromFileSystem(file))
@@ -454,49 +535,32 @@ class GroupWelcomePlugin(Star):
                 elif seg_type == "at":
                     content.append(Comp.At(qq=str(seg_data.get("qq", ""))))
                 elif seg_type == "forward":
-                    # 嵌套的合并转发 ▼
-                    fid = seg_data.get("id", "")
-                    if fid and bot and depth < MAX_DEPTH:
-                        try:
-                            ret = await bot.call_action(
-                                "get_forward_msg", message_id=str(fid)
-                            )
-                            if ret and "messages" in ret:
-                                nested = await GroupWelcomePlugin._parse_forward_api_response(
-                                    ret["messages"], bot=bot, depth=depth + 1
-                                )
-                                # 嵌套节点作为 Nodes 包裹
-                                if nested:
-                                    content.append(Comp.Nodes(nodes=nested))
-                        except Exception:
-                            pass
-                    if not fid or not bot or depth >= MAX_DEPTH:
-                        content.append(Comp.Plain(text="[嵌套转发消息]"))
+                    # 保留 Forward ID 引用，交由 _flatten_nodes_deep 递归解析
+                    content.append(Comp.Forward(id=str(seg_data.get("id", ""))))
                 elif seg_type == "node":
-                    # 直接嵌套的 node 类型
-                    nested_node = Comp.Node(
+                    # 内联 node 类型：先解析为简单 Node，嵌套转发由 _flatten_nodes_deep 处理
+                    inner = Comp.Node(
                         uin=str(seg_data.get("user_id", "0")),
                         name=seg_data.get("nickname", ""),
                         content=[],
                     )
-                    if seg_data.get("content"):
-                        # 递归解析嵌套 node 的 content
-                        for nested_seg in seg_data["content"]:
-                            nt = nested_seg.get("type", "")
-                            nd = nested_seg.get("data", {})
-                            if nt == "text":
-                                nested_node.content.append(Comp.Plain(text=nd.get("text", "")))
-                            elif nt == "image":
-                                nested_node.content.append(
-                                    Comp.Image.fromURL(nd.get("url", ""))
-                                    if nd.get("url", "").startswith("http")
-                                    else Comp.Image.fromFileSystem(nd.get("file", ""))
-                                )
-                            elif nt == "face":
-                                nested_node.content.append(Comp.Face(id=nd.get("id", 0)))
-                            elif nt == "at":
-                                nested_node.content.append(Comp.At(qq=str(nd.get("qq", ""))))
-                    content.append(nested_node)
+                    for ns in (seg_data.get("content") or []):
+                        nt = ns.get("type", "")
+                        nd = ns.get("data", {})
+                        if nt == "text":
+                            inner.content.append(Comp.Plain(text=nd.get("text", "")))
+                        elif nt == "image":
+                            inner.content.append(
+                                Comp.Image.fromURL(nd["url"]) if nd.get("url", "").startswith("http")
+                                else Comp.Image.fromFileSystem(nd.get("file", ""))
+                            )
+                        elif nt == "face":
+                            inner.content.append(Comp.Face(id=nd.get("id", 0)))
+                        elif nt == "at":
+                            inner.content.append(Comp.At(qq=str(nd.get("qq", ""))))
+                        elif nt == "forward":
+                            inner.content.append(Comp.Forward(id=str(nd.get("id", ""))))
+                    content.append(inner)
             if content:
                 nodes.append(Comp.Node(uin=uin, name=name, content=content))
         return nodes
