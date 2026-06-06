@@ -1,0 +1,8 @@
+name: astrbot_plugin_group_welcome # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
+display_name: 群聊入群欢迎 # 用于展示的名字
+desc: 新成员加群时通过临时会话推送群聊卡片、合并转发聊天记录和图片，支持群白名单。 # 插件简短描述
+version: v1.0.0 # 插件版本号
+author: YourName # 作者
+repo: https://github.com/YourName/astrbot_plugin_group_welcome # 插件的仓库地址
+support_platforms:
+  - aiocqhttp

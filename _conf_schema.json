@@ -1,0 +1,67 @@
+{
+  "enable": {
+    "description": "是否启用插件",
+    "type": "bool",
+    "default": true
+  },
+  "whitelist": {
+    "description": "群聊白名单（群号列表），只有白名单内的群才会发送入群欢迎",
+    "type": "list",
+    "default": [],
+    "hint": "填写需要生效的群号，例如 [\"123456789\", \"987654321\"]"
+  },
+  "welcome_config": {
+    "description": "入群欢迎配置",
+    "type": "object",
+    "items": {
+      "send_card": {
+        "description": "是否发送群聊卡片",
+        "type": "bool",
+        "default": true
+      },
+      "card_group_id": {
+        "description": "群聊卡片推荐的目标群号",
+        "type": "string",
+        "default": "",
+        "hint": "QQ 群号，留空则使用当前群号"
+      },
+      "send_forward": {
+        "description": "是否发送聊天记录（合并转发消息）",
+        "type": "bool",
+        "default": true
+      },
+      "forward_nodes": {
+        "description": "合并转发消息的节点配置",
+        "type": "list",
+        "default": [
+          {
+            "uin": "10001",
+            "name": "系统提示",
+            "content": [
+              {"type": "plain", "text": "欢迎加入本群！请先阅读群公告。"}
+            ]
+          },
+          {
+            "uin": "10002",
+            "name": "管理员",
+            "content": [
+              {"type": "plain", "text": "有问题可以随时@管理员哦～"}
+            ]
+          }
+        ],
+        "hint": "每个节点包含 uin(QQ号)、name(昵称)、content(消息内容列表，每项 {type: 'plain'|'image', text/file: '...'})"
+      },
+      "send_image": {
+        "description": "是否发送图片",
+        "type": "bool",
+        "default": true
+      },
+      "image_url": {
+        "description": "图片 URL 或本地文件路径",
+        "type": "string",
+        "default": "",
+        "hint": "支持 http/https URL 或本地绝对路径，如 C:/images/welcome.png"
+      }
+    }
+  }
+}
