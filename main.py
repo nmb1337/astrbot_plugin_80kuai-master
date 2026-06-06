@@ -25,13 +25,14 @@ from astrbot.api import logger, AstrBotConfig
 
 # ── 原始 forward 段包装器：完整保留 NapCat data 结构 ────────────────
 
-class _RawForward:
-    """保存 NapCat get_forward_msg 返回的原始 forward 段 data。
-    调用 toDict() 时输出 {"type":"forward","data":{...}}，
-    Node.to_dict() 的 else 分支会自动将其落入父级 content 数组，
-    从而完整保留嵌套转发卡片。
+class _RawForward(Comp.Forward):
+    """扩展 Comp.Forward，额外保存 NapCat 返回的完整 data 字典。
+    继承自 Comp.Forward（即 BaseMessageComponent），可安全放入 Node.content。
+    toDict() 输出 {"type":"forward","data":{...}}，由 Node.to_dict() 的
+    else 分支自动落入父级 content 数组，完整保留嵌套转发卡片。
     """
     def __init__(self, data: dict):
+        super().__init__(id=str(data.get("id", "")))
         self._data = data
 
     def toDict(self) -> dict:
