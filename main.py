@@ -26,7 +26,7 @@ from astrbot.api import logger, AstrBotConfig
 # ── 序列化 / 反序列化工具 ─────────────────────────────────────────────
 
 def _serialize_component(comp) -> dict | None:
-    """将单个消息组件序列化为可 JSON 存储的 dict（支持递归嵌套 Node）"""
+    """将单个消息组件序列化为可 JSON 存储的 dict（嵌套 Node 替换为占位文本）"""
     if isinstance(comp, Comp.Plain):
         return {"type": "plain", "text": comp.text or ""}
     if isinstance(comp, Comp.Image):
@@ -43,23 +43,18 @@ def _serialize_component(comp) -> dict | None:
         return {"type": "face", "id": getattr(comp, "id", 0)}
     if isinstance(comp, Comp.At):
         return {"type": "at", "qq": str(getattr(comp, "qq", ""))}
-    # 递归处理嵌套的合并转发节点 ▼
+    # 嵌套的合并转发节点：替换为占位文本，节点本身由 _flatten_nodes 提取到顶层
     if isinstance(comp, Comp.Node):
-        return _serialize_node(comp)
+        return {"type": "plain", "text": "[聊天记录]"}
     if isinstance(comp, Comp.Nodes):
-        # 多个嵌套节点展开为独立 node
-        return {
-            "type": "nodes_wrapper",
-            "nodes": [_serialize_node(n) for n in comp.nodes],
-        }
+        return {"type": "plain", "text": "[聊天记录]"}
     if isinstance(comp, Comp.Forward):
-        return {"type": "forward_ref", "id": str(getattr(comp, "id", ""))}
-    # 其他类型简单标记
-    return {"type": "plain", "text": f"[暂不支持的消息类型: {type(comp).__name__}]"}
+        return {"type": "plain", "text": "[聊天记录]"}
+    return {"type": "plain", "text": f"[{type(comp).__name__}]"}
 
 
 def _deserialize_component(data: dict) -> Comp.BaseMessageComponent:
-    """从存储的 dict 还原消息组件（支持递归嵌套 Node）"""
+    """从存储的 dict 还原消息组件（不支持嵌套，因为已扁平化）"""
     t = data.get("type", "plain")
     if t == "plain":
         return Comp.Plain(text=data.get("text", ""))
@@ -75,14 +70,6 @@ def _deserialize_component(data: dict) -> Comp.BaseMessageComponent:
         return Comp.Face(id=data.get("id", 0))
     if t == "at":
         return Comp.At(qq=data.get("qq", ""))
-    # 递归还原嵌套的合并转发节点 ▼
-    if t == "node":
-        return _deserialize_node(data)
-    if t == "nodes_wrapper":
-        nodes = [_deserialize_node(n) for n in data.get("nodes", [])]
-        return Comp.Nodes(nodes=nodes)
-    if t == "forward_ref":
-        return Comp.Plain(text=f"[引用转发消息 id={data.get('id', '?')}]")
     return Comp.Plain(text=data.get("text", "[未知消息]"))
 
 
@@ -98,6 +85,22 @@ def _serialize_node(node: Comp.Node) -> dict:
         "name": node.name or "",
         "content": content,
     }
+
+
+def _flatten_nodes(nodes: list[Comp.Node]) -> list[Comp.Node]:
+    """将嵌套的 Node 扁平化为单层列表，保持顺序。
+    例如 [A, B[含 C, D], E] → [A, B, C, D, E]
+    其中 B 内的嵌套节点被替换为占位文本。
+    """
+    result = []
+    for node in nodes:
+        result.append(node)
+        for c in (node.content or []):
+            if isinstance(c, Comp.Node):
+                result.extend(_flatten_nodes([c]))
+            elif isinstance(c, Comp.Nodes):
+                result.extend(_flatten_nodes(c.nodes))
+    return result
 
 
 def _deserialize_node(data: dict) -> Comp.Node:
@@ -148,7 +151,6 @@ class GroupWelcomePlugin(Star):
         if not nodes:
             # 输出诊断信息帮助用户排查
             msgs = event.get_messages()
-            comp_types = [type(c).__name__ for c in msgs]
             detail = "\n".join(
                 f"  [{i}] {type(c).__name__}" for i, c in enumerate(msgs)
             ) or "  （消息链为空）"
@@ -163,6 +165,8 @@ class GroupWelcomePlugin(Star):
             )
             return
 
+        # 扁平化嵌套节点，确保所有节点都在同一层
+        nodes = _flatten_nodes(nodes)
         stored = [_serialize_node(n) for n in nodes]
         wc = self.config.get("welcome_config", {})
         wc["forward_nodes"] = stored
