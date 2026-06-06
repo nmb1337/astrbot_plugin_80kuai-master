@@ -64,7 +64,19 @@ def _convert_content_segments(segments: list) -> list:
             url = d.get("url", "")
             if url and url.startswith("http"):
                 d["file"] = url
-            out.append({"type": t, "data": d})
+                out.append({"type": t, "data": d})
+            elif d.get("file", "").startswith("http"):
+                out.append({"type": t, "data": d})
+            else:
+                label = {"image": "[图片]", "video": "[视频]", "record": "[语音]"}.get(t, f"[{t}]")
+                logger.warning(f"[GroupWelcome] {t} 无有效URL，降级为文本")
+                out.append({"type": "text", "data": {"text": label}})
+        elif t == "file":
+            d = seg.get("data", {})
+            name = str(d.get("name") or d.get("file") or "未知文件")
+            if len(name) > 40:
+                name = name[:40] + "..."
+            out.append({"type": "text", "data": {"text": f"[文件: {name}]"}})
         else:
             # text / face / at / markdown / reply 等直接保留
             logger.debug(f"[GroupWelcome] convert passthrough segment type={t}")
