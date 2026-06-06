@@ -23,26 +23,6 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 
 
-# ── 原始 forward 段包装器：完整保留 NapCat data 结构 ────────────────
-
-class _RawForward(Comp.Forward):
-    """扩展 Comp.Forward，保存 NapCat 返回的完整 data 字典。
-    继承自 Comp.Forward（即 BaseMessageComponent），可安全放入 Node.content。
-    toDict() 输出 {"type":"forward","data":{...}}，完整保留嵌套转发卡片。
-    通过 __dict__ 直接读写 _raw_data，绕过 Pydantic 的属性拦截。
-    """
-    def __init__(self, data: dict):
-        super().__init__(id=str(data.get("id", "")))
-        self.__dict__["_raw_data"] = data
-
-    @property
-    def raw_data(self) -> dict:
-        return self.__dict__.get("_raw_data", {})
-
-    def toDict(self) -> dict:
-        return {"type": "forward", "data": self.raw_data}
-
-
 # ── 序列化 / 反序列化工具 ─────────────────────────────────────────────
 
 def _serialize_component(comp) -> dict | None:
@@ -63,9 +43,6 @@ def _serialize_component(comp) -> dict | None:
         return {"type": "face", "id": getattr(comp, "id", 0)}
     if isinstance(comp, Comp.At):
         return {"type": "at", "qq": str(getattr(comp, "qq", ""))}
-    if isinstance(comp, _RawForward):
-        # 完整保留原始 forward 段 data（不解构，不递归）
-        return {"type": "forward", "data": comp.raw_data}
     if isinstance(comp, Comp.Node):
         # 递归：嵌套的合并转发节点保留原结构
         return _serialize_node(comp)
@@ -98,8 +75,8 @@ def _deserialize_component(data: dict) -> Comp.BaseMessageComponent:
     if t == "at":
         return Comp.At(qq=data.get("qq", ""))
     if t == "forward":
-        # 完整还原原始 forward 段（不解构，保留原生嵌套卡片）
-        return _RawForward(data.get("data", {}))
+        # 旧数据兼容：之前存储的 forward 类型，降级为占位文本
+        return Comp.Plain(text="[聊天记录]")
     if t == "node":
         # 递归：还原嵌套的合并转发节点
         return _deserialize_node(data)
@@ -496,8 +473,28 @@ class GroupWelcomePlugin(Star):
                     content.append(Comp.At(qq=str(seg_data.get("qq", ""))))
 
                 elif seg_type == "forward":
-                    # ── 嵌套转发：完整保留原结构，不解构、不递归拆解 ──
-                    content.append(_RawForward(seg_data))
+                    # ── 嵌套转发：解析内联消息为 Comp.Node，嵌套在父节点 content 中 ──
+                    inline_msgs = seg_data.get("content") or seg_data.get("messages")
+                    if inline_msgs and isinstance(inline_msgs, list):
+                        inner_nodes = await GroupWelcomePlugin._parse_forward_api_response(
+                            inline_msgs, bot=bot, depth=depth + 1
+                        )
+                        # 作为嵌套节点加入父 content（用 Comp.Node 保留发信人身份）
+                        content.extend(inner_nodes)
+                    elif bot:
+                        try:
+                            inner_ret = await bot.call_action(
+                                "get_forward_msg", message_id=str(seg_data.get("id", ""))
+                            )
+                            if inner_ret and "messages" in inner_ret:
+                                inner_nodes = await GroupWelcomePlugin._parse_forward_api_response(
+                                    inner_ret["messages"], bot=bot, depth=depth + 1
+                                )
+                                content.extend(inner_nodes)
+                        except Exception:
+                            logger.warning(
+                                f"[GroupWelcome] 嵌套转发 API 解析失败，已跳过"
+                            )
 
                 elif seg_type == "node":
                     # ── 内联 node：递归解析其 content ──
@@ -522,8 +519,13 @@ class GroupWelcomePlugin(Star):
                         elif nt == "at":
                             inner.content.append(Comp.At(qq=str(nd.get("qq", ""))))
                         elif nt == "forward":
-                            # 完整保留嵌套 forward 段
-                            inner.content.append(_RawForward(nd))
+                            # 内联 node 内的嵌套转发 → 解析为 Comp.Node 嵌套
+                            n_inline = nd.get("content") or nd.get("messages")
+                            if n_inline and isinstance(n_inline, list):
+                                n_inner = await GroupWelcomePlugin._parse_forward_api_response(
+                                    n_inline, bot=bot, depth=depth + 1
+                                )
+                                inner.content.extend(n_inner)
                     content.append(inner)
 
             # 当前消息有内容（非全为已展开的嵌套转发）则作为独立节点
