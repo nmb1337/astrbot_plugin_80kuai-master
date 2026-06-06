@@ -5,23 +5,99 @@ astrbot_plugin_group_welcome —— 群聊入群欢迎插件
   - 监听 QQ 群「新成员加群」事件（OneBot v11 / aiocqhttp）
   - 通过临时会话向新成员依次发送：
       1. 群聊卡片（推荐加群 / 群名片）
-      2. 聊天记录（QQ 合并转发消息）
+      2. 聊天记录（QQ 合并转发消息，可发送一条已有的合并转发让机器人捕获）
       3. 图片（自定义 URL 或本地路径）
   - 支持群白名单：仅白名单内的群触发欢迎
-  - 所有内容均可通过 WebUI 配置 (_conf_schema.json)
+  - 通过 /welcome 指令设置欢迎内容
+
+用法：
+  1. 先发送一条 QQ 合并转发消息到群里
+  2. 引用（回复）那条消息，发送 /welcome set_forward
+  3. 机器人会捕获该合并转发并保存
+  4. 之后新成员加群时自动转发该聊天记录（通过临时会话）
 """
 
+import astrbot.api.message_components as Comp
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
-from astrbot.api.message_components import Node, Nodes, Plain, Image, Contact
 
+
+# ── 序列化 / 反序列化工具 ─────────────────────────────────────────────
+
+def _serialize_component(comp) -> dict | None:
+    """将单个消息组件序列化为可 JSON 存储的 dict"""
+    if isinstance(comp, Comp.Plain):
+        return {"type": "plain", "text": comp.text or ""}
+    if isinstance(comp, Comp.Image):
+        url = getattr(comp, "url", None)
+        file = getattr(comp, "file", None)
+        path = getattr(comp, "path", None)
+        src = url or file or path or ""
+        if src:
+            if isinstance(src, str) and src.startswith("http"):
+                return {"type": "image", "url": src}
+            return {"type": "image", "file": str(src)}
+        return None
+    if isinstance(comp, Comp.Face):
+        return {"type": "face", "id": getattr(comp, "id", 0)}
+    if isinstance(comp, Comp.At):
+        return {"type": "at", "qq": str(getattr(comp, "qq", ""))}
+    # 其他类型简单标记
+    return {"type": "plain", "text": "[暂不支持的消息类型]"}
+
+
+def _deserialize_component(data: dict) -> Comp.BaseMessageComponent:
+    """从存储的 dict 还原消息组件"""
+    t = data.get("type", "plain")
+    if t == "plain":
+        return Comp.Plain(text=data.get("text", ""))
+    if t == "image":
+        url = data.get("url", "")
+        if url:
+            return Comp.Image.fromURL(url)
+        file = data.get("file", "")
+        if file:
+            return Comp.Image.fromFileSystem(file)
+        return Comp.Plain(text="[图片]")
+    if t == "face":
+        return Comp.Face(id=data.get("id", 0))
+    if t == "at":
+        return Comp.At(qq=data.get("qq", ""))
+    return Comp.Plain(text=data.get("text", "[未知消息]"))
+
+
+def _serialize_node(node: Comp.Node) -> dict:
+    """将 Node 序列化为可存储的 dict"""
+    content = []
+    for c in (node.content or []):
+        s = _serialize_component(c)
+        if s:
+            content.append(s)
+    return {
+        "uin": str(node.uin or "0"),
+        "name": node.name or "",
+        "content": content,
+    }
+
+
+def _deserialize_node(data: dict) -> Comp.Node:
+    """从存储的 dict 还原 Node"""
+    content = [_deserialize_component(c) for c in data.get("content", [])]
+    return Comp.Node(
+        uin=str(data.get("uin", "0")),
+        name=data.get("name", ""),
+        content=content,
+    )
+
+
+# ── 插件主体 ──────────────────────────────────────────────────────────
 
 @register(
     "astrbot_plugin_group_welcome",
     "YourName",
-    "新成员加群时通过临时会话推送群聊卡片、合并转发聊天记录和图片，支持群白名单。",
-    "1.0.0",
+    "新成员加群时临时会话推送群聊卡片、合并转发聊天记录和图片，支持群白名单。",
+    "1.1.0",
 )
 class GroupWelcomePlugin(Star):
     """入群欢迎插件"""
@@ -31,34 +107,128 @@ class GroupWelcomePlugin(Star):
         self.config = config
 
     async def initialize(self):
-        """插件初始化（可选）"""
         logger.info("GroupWelcomePlugin 已初始化")
 
-    # ── 监听所有 aiocqhttp 事件，过滤 group_increase 通知 ──────────────
+    # ══════════════════════════════════════════════════════════════════
+    # 指令：/welcome set_forward / set_card / set_image / show / clear
+    # ══════════════════════════════════════════════════════════════════
+
+    @filter.command_group("welcome")
+    def welcome(self):
+        """入群欢迎设置指令组"""
+        pass
+
+    @welcome.command("set_forward")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_set_forward(self, event: AstrMessageEvent):
+        """捕获引用消息中的合并转发聊天记录并保存"""
+        nodes = await self._extract_forward_nodes(event)
+        if not nodes:
+            yield event.plain_result(
+                "❌ 未找到合并转发消息。\n"
+                "请先发送一条 QQ 合并转发聊天记录，然后**引用（回复）**它再发送 /welcome set_forward。"
+            )
+            return
+
+        stored = [_serialize_node(n) for n in nodes]
+        wc = self.config.get("welcome_config", {})
+        wc["forward_nodes"] = stored
+        self.config["welcome_config"] = wc
+        self.config.save_config()
+
+        yield event.plain_result(
+            f"✅ 已捕获 {len(stored)} 条转发消息节点，新成员加群时将自动发送此聊天记录。"
+        )
+
+    @welcome.command("set_card")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_set_card(self, event: AstrMessageEvent, group_id: str = ""):
+        """设置群聊卡片推荐的目标群号。用法：/welcome set_card 123456789"""
+        wc = self.config.get("welcome_config", {})
+        if not group_id:
+            # 不带参数则使用当前群
+            group_id = event.get_group_id() or ""
+        wc["card_group_id"] = str(group_id)
+        wc["send_card"] = True
+        self.config["welcome_config"] = wc
+        self.config.save_config()
+        yield event.plain_result(f"✅ 群聊卡片目标群号已设置为：{group_id}")
+
+    @welcome.command("set_image")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_set_image(self, event: AstrMessageEvent, url: str = ""):
+        """设置欢迎图片。用法：/welcome set_image https://example.com/img.png"""
+        wc = self.config.get("welcome_config", {})
+        if not url:
+            # 尝试从当前消息中提取图片
+            for comp in event.get_messages():
+                if isinstance(comp, Comp.Image):
+                    url = getattr(comp, "url", "") or getattr(comp, "file", "") or ""
+                    break
+        if not url:
+            yield event.plain_result("❌ 请提供图片 URL 或路径，例如 /welcome set_image https://xxx.png")
+            return
+        wc["image_url"] = url
+        wc["send_image"] = True
+        self.config["welcome_config"] = wc
+        self.config.save_config()
+        yield event.plain_result(f"✅ 欢迎图片已设置为：{url}")
+
+    @welcome.command("show")
+    async def cmd_show(self, event: AstrMessageEvent):
+        """查看当前入群欢迎配置"""
+        wc = self.config.get("welcome_config", {})
+        whitelist = self.config.get("whitelist", [])
+        enabled = self.config.get("enable", True)
+
+        lines = [
+            f"🔧 状态：{'🟢 已启用' if enabled else '🔴 已禁用'}",
+            f"🛡️ 白名单：{whitelist if whitelist else '（空=所有群生效）'}",
+            f"🃏 群聊卡片：{'✅' if wc.get('send_card') else '❌'} 目标群={wc.get('card_group_id', '当前群')}",
+            f"📨 合并转发：{'✅' if wc.get('send_forward') else '❌'} 共 {len(wc.get('forward_nodes', []))} 条消息节点",
+            f"🖼️ 欢迎图片：{'✅' if wc.get('send_image') else '❌'} {wc.get('image_url', '未设置')[:60]}",
+        ]
+        yield event.plain_result("\n".join(lines))
+
+    @welcome.command("clear")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_clear(self, event: AstrMessageEvent):
+        """清除所有已保存的欢迎内容（保留白名单）"""
+        wc = self.config.get("welcome_config", {})
+        wc["forward_nodes"] = []
+        wc["image_url"] = ""
+        wc["card_group_id"] = ""
+        wc["send_card"] = False
+        wc["send_forward"] = False
+        wc["send_image"] = False
+        self.config["welcome_config"] = wc
+        self.config.save_config()
+        yield event.plain_result("✅ 已清除所有欢迎内容（白名单不变）。")
+
+    # ══════════════════════════════════════════════════════════════════
+    # 事件监听：新成员加群
+    # ══════════════════════════════════════════════════════════════════
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     async def on_notice_group_increase(self, event: AstrMessageEvent):
         """当收到群成员增加通知时触发欢迎流程"""
-        # 1. 检查是否启用
         if not self.config.get("enable", True):
             return
 
-        # 2. 确认是群成员增加通知
         raw = event.message_obj.raw_message
         notice_type = raw.get("notice_type", "")
         if notice_type != "group_increase":
             return
 
-        # 3. 获取群号和新人 QQ
         group_id = str(raw.get("group_id", ""))
         user_id = str(raw.get("user_id", ""))
         if not group_id or not user_id:
             logger.warning("[GroupWelcome] 无法获取 group_id 或 user_id，跳过")
             return
 
-        # 4. 白名单检查
+        # 白名单检查
         whitelist = self.config.get("whitelist", [])
-        # 统一转为字符串比较
         whitelist_str = [str(g) for g in whitelist]
         if whitelist_str and group_id not in whitelist_str:
             logger.info(f"[GroupWelcome] 群 {group_id} 不在白名单中，跳过")
@@ -66,108 +236,162 @@ class GroupWelcomePlugin(Star):
 
         logger.info(f"[GroupWelcome] 检测到新成员 {user_id} 加入群 {group_id}")
 
-        # 5. 获取 bot 客户端（aiocqhttp 专用）
+        # 获取 bot 客户端
         from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
             AiocqhttpMessageEvent,
         )
-
         if not isinstance(event, AiocqhttpMessageEvent):
             logger.warning("[GroupWelcome] 非 aiocqhttp 事件，跳过")
             return
         bot = event.bot
 
-        # 6. 读取欢迎配置
         wc = self.config.get("welcome_config", {})
 
-        # ── 6a. 发送群聊卡片 ─────────────────────────────────────────
+        # 发送群聊卡片
         if wc.get("send_card", True):
             await self._send_group_card(bot, user_id, group_id, wc)
 
-        # ── 6b. 发送合并转发聊天记录 ─────────────────────────────────
+        # 发送合并转发聊天记录
         if wc.get("send_forward", True):
-            await self._send_forward_nodes(bot, user_id, group_id, wc)
+            await self._send_stored_forward(bot, user_id, group_id, wc)
 
-        # ── 6c. 发送图片 ─────────────────────────────────────────────
+        # 发送图片
         if wc.get("send_image", True):
             await self._send_welcome_image(bot, user_id, group_id, wc)
 
-        # 停止事件传播，避免后续 pipeline 处理此通知事件
         event.stop_event()
 
-    # ── 辅助方法 ──────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════
+    # 辅助方法
+    # ══════════════════════════════════════════════════════════════════
+
+    async def _extract_forward_nodes(self, event: AstrMessageEvent) -> list[Comp.Node]:
+        """从事件消息中提取合并转发节点。
+        优先级：引用消息 > 当前消息 > Forward ID API 查询
+        """
+        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+            AiocqhttpMessageEvent,
+        )
+
+        # 1. 先从引用消息中提取
+        for comp in event.get_messages():
+            if isinstance(comp, Comp.Reply) and comp.chain:
+                nodes = self._find_nodes_in_chain(comp.chain)
+                if nodes:
+                    return nodes
+
+        # 2. 从当前消息中提取
+        nodes = self._find_nodes_in_chain(event.get_messages())
+        if nodes:
+            return nodes
+
+        # 3. 若有 Forward（引用 ID），尝试通过 API 获取
+        if isinstance(event, AiocqhttpMessageEvent):
+            bot = event.bot
+            for comp in event.get_messages():
+                if isinstance(comp, Comp.Forward) and comp.id:
+                    try:
+                        ret = await bot.call_action(
+                            "get_forward_msg",
+                            message_id=str(comp.id),
+                        )
+                        if ret and "messages" in ret:
+                            nodes = self._parse_forward_api_response(ret["messages"])
+                            if nodes:
+                                return nodes
+                    except Exception as e:
+                        logger.error(f"[GroupWelcome] 获取转发消息失败: {e}")
+
+        return []
+
+    @staticmethod
+    def _find_nodes_in_chain(chain: list) -> list[Comp.Node]:
+        """在消息链中查找 Node/Nodes"""
+        nodes = []
+        for comp in chain:
+            if isinstance(comp, Comp.Node):
+                nodes.append(comp)
+            elif isinstance(comp, Comp.Nodes):
+                nodes.extend(comp.nodes)
+        return nodes
+
+    @staticmethod
+    def _parse_forward_api_response(messages: list) -> list[Comp.Node]:
+        """将 get_forward_msg API 返回的 messages 列表解析为 Node 列表"""
+        nodes = []
+        for msg in messages:
+            sender = msg.get("sender", {})
+            uin = str(sender.get("user_id", "0"))
+            name = sender.get("nickname", "")
+            raw_content = msg.get("message") or msg.get("content") or []
+            content = []
+            for seg in raw_content:
+                seg_type = seg.get("type", "")
+                seg_data = seg.get("data", {})
+                if seg_type == "text":
+                    content.append(Comp.Plain(text=seg_data.get("text", "")))
+                elif seg_type == "image":
+                    url = seg_data.get("url", "")
+                    file = seg_data.get("file", "")
+                    if url:
+                        content.append(Comp.Image.fromURL(url))
+                    elif file:
+                        content.append(Comp.Image.fromFileSystem(file))
+                elif seg_type == "face":
+                    content.append(Comp.Face(id=seg_data.get("id", 0)))
+                elif seg_type == "at":
+                    content.append(Comp.At(qq=str(seg_data.get("qq", ""))))
+            if content:
+                nodes.append(Comp.Node(uin=uin, name=name, content=content))
+        return nodes
 
     async def _send_group_card(self, bot, user_id: str, group_id: str, wc: dict):
-        """通过临时会话发送群聊卡片（推荐加群）"""
+        """通过临时会话发送群聊卡片"""
         try:
             card_group_id = wc.get("card_group_id", "") or group_id
-            contact_msg = [
-                {
-                    "type": "contact",
-                    "data": {
-                        "type": "group",  # 推荐群
-                        "id": str(card_group_id),
-                    },
-                }
-            ]
-            ret = await bot.call_action(
+            contact_msg = [{
+                "type": "contact",
+                "data": {"type": "group", "id": str(card_group_id)},
+            }]
+            await bot.call_action(
                 "send_private_msg",
                 user_id=user_id,
-                group_id=group_id,  # 临时会话需要带上 group_id
+                group_id=group_id,
                 message=contact_msg,
             )
-            logger.info(f"[GroupWelcome] 群聊卡片已发送 -> {user_id}, ret={ret}")
+            logger.info(f"[GroupWelcome] 群聊卡片已发送 -> {user_id}")
         except Exception as e:
             logger.error(f"[GroupWelcome] 发送群聊卡片失败: {e}")
 
-    async def _send_forward_nodes(self, bot, user_id: str, group_id: str, wc: dict):
-        """通过临时会话发送合并转发聊天记录"""
+    async def _send_stored_forward(self, bot, user_id: str, group_id: str, wc: dict):
+        """发送已存储的合并转发聊天记录"""
         try:
-            forward_cfgs = wc.get("forward_nodes", [])
-            if not forward_cfgs:
-                logger.info("[GroupWelcome] 未配置 forward_nodes，跳过合并转发")
+            stored = wc.get("forward_nodes", [])
+            if not stored:
+                logger.info("[GroupWelcome] 未存储 forward_nodes，跳过合并转发")
                 return
 
-            nodes = []
-            for node_cfg in forward_cfgs:
-                content = []
-                for item in node_cfg.get("content", []):
-                    t = item.get("type", "plain")
-                    if t == "plain":
-                        content.append(Plain(text=item.get("text", "")))
-                    elif t == "image":
-                        src = item.get("file", "") or item.get("url", "")
-                        if src.startswith("http"):
-                            content.append(Image.fromURL(src))
-                        elif src:
-                            content.append(Image.fromFileSystem(src))
-                node = Node(
-                    uin=str(node_cfg.get("uin", "0")),
-                    name=node_cfg.get("name", ""),
-                    content=content,
-                )
-                nodes.append(node)
+            nodes = [_deserialize_node(item) for item in stored]
+            nodes_obj = Comp.Nodes(nodes=nodes)
+            messages = (await nodes_obj.to_dict())["messages"]
 
-            if nodes:
-                nodes_obj = Nodes(nodes=nodes)
-                messages = (await nodes_obj.to_dict())["messages"]
-                # 尝试附加 group_id 以支持临时会话场景
-                try:
-                    await bot.call_action(
-                        "send_private_forward_msg",
-                        user_id=user_id,
-                        group_id=group_id,
-                        messages=messages,
-                    )
-                except Exception:
-                    # 部分协议端可能不支持 group_id 参数，回退无 group_id
-                    await bot.call_action(
-                        "send_private_forward_msg",
-                        user_id=user_id,
-                        messages=messages,
-                    )
-                logger.info(f"[GroupWelcome] 合并转发消息已发送 -> {user_id}")
+            # 先尝试带 group_id（临时会话），失败则回退
+            try:
+                await bot.call_action(
+                    "send_private_forward_msg",
+                    user_id=user_id,
+                    group_id=group_id,
+                    messages=messages,
+                )
+            except Exception:
+                await bot.call_action(
+                    "send_private_forward_msg",
+                    user_id=user_id,
+                    messages=messages,
+                )
+            logger.info(f"[GroupWelcome] 合并转发已发送 -> {user_id}")
         except Exception as e:
-            logger.error(f"[GroupWelcome] 发送合并转发消息失败: {e}")
+            logger.error(f"[GroupWelcome] 发送合并转发失败: {e}")
 
     async def _send_welcome_image(self, bot, user_id: str, group_id: str, wc: dict):
         """通过临时会话发送图片"""
@@ -179,11 +403,10 @@ class GroupWelcomePlugin(Star):
             from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
                 AiocqhttpMessageEvent,
             )
-
             if image_url.startswith("http"):
-                img = Image.fromURL(image_url)
+                img = Comp.Image.fromURL(image_url)
             else:
-                img = Image.fromFileSystem(image_url)
+                img = Comp.Image.fromFileSystem(image_url)
             img_dict = await AiocqhttpMessageEvent._from_segment_to_dict(img)
             await bot.call_action(
                 "send_private_msg",
@@ -196,6 +419,5 @@ class GroupWelcomePlugin(Star):
             logger.error(f"[GroupWelcome] 发送欢迎图片失败: {e}")
 
     async def terminate(self):
-        """插件卸载时调用（可选）"""
         logger.info("GroupWelcomePlugin 已卸载")
 
