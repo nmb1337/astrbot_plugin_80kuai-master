@@ -23,6 +23,21 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
 
 
+# ── 原始 forward 段包装器：完整保留 NapCat data 结构 ────────────────
+
+class _RawForward:
+    """保存 NapCat get_forward_msg 返回的原始 forward 段 data。
+    调用 toDict() 时输出 {"type":"forward","data":{...}}，
+    Node.to_dict() 的 else 分支会自动将其落入父级 content 数组，
+    从而完整保留嵌套转发卡片。
+    """
+    def __init__(self, data: dict):
+        self._data = data
+
+    def toDict(self) -> dict:
+        return {"type": "forward", "data": self._data}
+
+
 # ── 序列化 / 反序列化工具 ─────────────────────────────────────────────
 
 def _serialize_component(comp) -> dict | None:
@@ -43,6 +58,9 @@ def _serialize_component(comp) -> dict | None:
         return {"type": "face", "id": getattr(comp, "id", 0)}
     if isinstance(comp, Comp.At):
         return {"type": "at", "qq": str(getattr(comp, "qq", ""))}
+    if isinstance(comp, _RawForward):
+        # 完整保留原始 forward 段 data（不解构，不递归）
+        return {"type": "forward", "data": comp._data}
     if isinstance(comp, Comp.Node):
         # 递归：嵌套的合并转发节点保留原结构
         return _serialize_node(comp)
@@ -74,6 +92,9 @@ def _deserialize_component(data: dict) -> Comp.BaseMessageComponent:
         return Comp.Face(id=data.get("id", 0))
     if t == "at":
         return Comp.At(qq=data.get("qq", ""))
+    if t == "forward":
+        # 完整还原原始 forward 段（不解构，保留原生嵌套卡片）
+        return _RawForward(data.get("data", {}))
     if t == "node":
         # 递归：还原嵌套的合并转发节点
         return _deserialize_node(data)
@@ -98,106 +119,6 @@ def _serialize_node(node: Comp.Node) -> dict:
         "name": node.name or "",
         "content": content,
     }
-
-
-async def _flatten_nodes_deep(
-    nodes: list[Comp.Node],
-    bot,
-    depth: int = 0,
-) -> list[Comp.Node]:
-    """递归展开嵌套合并转发，将所有层级的消息平铺为单层 Node 列表。
-
-    规则：
-    - 遍历每个 Node，检查其 content 中是否存在 Comp.Node / Comp.Nodes / Comp.Forward
-    - Comp.Node / Comp.Nodes → 递归展开子节点，插入到当前层级
-    - Comp.Forward → 尝试 _resolve_forward_ref 解析，失败则跳过（无占位文字）
-    - 若当前 Node 的 content 全是嵌套转发（无常规内容），则丢弃该 Node
-    - 最大递归深度 5 层
-    """
-    MAX_DEPTH = 5
-    if depth > MAX_DEPTH:
-        logger.warning("[GroupWelcome] _flatten_nodes_deep 达到最大深度")
-        return nodes
-
-    result: list[Comp.Node] = []
-    for node in nodes:
-        regular: list[Comp.BaseMessageComponent] = []
-        nested_nodes: list[Comp.Node] = []
-
-        for comp in (node.content or []):
-            if isinstance(comp, Comp.Node):
-                nested_nodes.append(comp)
-            elif isinstance(comp, Comp.Nodes):
-                nested_nodes.extend(comp.nodes)
-            elif isinstance(comp, Comp.Forward):
-                # 兜底：若仍有未解析的 Forward 引用，尝试解析
-                if bot:
-                    resolved = await _resolve_forward_ref(bot, str(comp.id))
-                    if resolved:
-                        nested_nodes.extend(resolved)
-                    else:
-                        logger.warning(
-                            f"[GroupWelcome] 无法解析 Forward id={comp.id}，已跳过"
-                        )
-                else:
-                    logger.warning(
-                        f"[GroupWelcome] 无 bot，跳过 Forward id={comp.id}"
-                    )
-            else:
-                regular.append(comp)
-
-        if nested_nodes:
-            expanded = await _flatten_nodes_deep(nested_nodes, bot, depth + 1)
-            if regular:
-                node.content = regular
-                result.append(node)
-            result.extend(expanded)
-        else:
-            result.append(node)
-
-    return result
-
-
-async def _resolve_forward_ref(bot, forward_id: str) -> list[Comp.Node]:
-    """兜底：通过 get_forward_msg API 解析 Forward ID。
-    注意：NapCat 对内层（嵌套）转发返回 retcode=1200，此函数仅作最后兜底。
-    """
-    try:
-        logger.info(f"[GroupWelcome] 兜底解析 Forward id={forward_id}")
-        ret = await bot.call_action("get_forward_msg", message_id=forward_id)
-        if ret and "messages" in ret:
-            nodes = []
-            for msg in ret["messages"]:
-                sender = msg.get("sender", {})
-                uin = str(sender.get("user_id", "0"))
-                name = sender.get("nickname", "")
-                raw = msg.get("message") or msg.get("content") or []
-                content = []
-                for seg in raw:
-                    t = seg.get("type", "")
-                    d = seg.get("data", {})
-                    if t == "text":
-                        content.append(Comp.Plain(text=d.get("text", "")))
-                    elif t == "image":
-                        content.append(
-                            Comp.Image.fromURL(d["url"]) if d.get("url", "").startswith("http")
-                            else Comp.Image.fromFileSystem(d.get("file", ""))
-                        )
-                    elif t == "face":
-                        content.append(Comp.Face(id=d.get("id", 0)))
-                    elif t == "at":
-                        content.append(Comp.At(qq=str(d.get("qq", ""))))
-                    elif t == "forward":
-                        content.append(Comp.Forward(id=str(d.get("id", ""))))
-                if content:
-                    nodes.append(Comp.Node(uin=uin, name=name, content=content))
-            return nodes
-    except Exception:
-        # NapCat retcode=1200: 内层消息无法单独获取，静默跳过
-        logger.debug(
-            f"[GroupWelcome] 兜底解析 Forward id={forward_id} 失败（可能为内层消息）"
-        )
-    return []
 
 
 def _deserialize_node(data: dict) -> Comp.Node:
@@ -570,38 +491,8 @@ class GroupWelcomePlugin(Star):
                     content.append(Comp.At(qq=str(seg_data.get("qq", ""))))
 
                 elif seg_type == "forward":
-                    # ── 嵌套转发：保留原结构，不解构、不扁平化 ──
-                    fid = seg_data.get("id", "")
-                    inline_msgs = seg_data.get("content") or seg_data.get("messages")
-
-                    if inline_msgs and isinstance(inline_msgs, list):
-                        logger.info(
-                            f"[GroupWelcome] 嵌套转发 id={fid} 保留嵌套结构 "
-                            f"({len(inline_msgs)} 条消息)"
-                        )
-                        inner_nodes = await GroupWelcomePlugin._parse_forward_api_response(
-                            inline_msgs, bot=bot, depth=depth + 1
-                        )
-                        # 每个内层节点作为独立 Comp.Node 加入父节点 content
-                        content.extend(inner_nodes)
-                    elif fid and bot:
-                        try:
-                            inner_ret = await bot.call_action(
-                                "get_forward_msg", message_id=str(fid)
-                            )
-                            if inner_ret and "messages" in inner_ret:
-                                inner_nodes = await GroupWelcomePlugin._parse_forward_api_response(
-                                    inner_ret["messages"], bot=bot, depth=depth + 1
-                                )
-                                content.extend(inner_nodes)
-                        except Exception:
-                            logger.warning(
-                                f"[GroupWelcome] 嵌套转发 id={fid} API 解析失败，已跳过"
-                            )
-                    else:
-                        logger.warning(
-                            f"[GroupWelcome] 嵌套转发 id={fid} 无内联数据且无 bot，已跳过"
-                        )
+                    # ── 嵌套转发：完整保留原结构，不解构、不递归拆解 ──
+                    content.append(_RawForward(seg_data))
 
                 elif seg_type == "node":
                     # ── 内联 node：递归解析其 content ──
@@ -626,10 +517,8 @@ class GroupWelcomePlugin(Star):
                         elif nt == "at":
                             inner.content.append(Comp.At(qq=str(nd.get("qq", ""))))
                         elif nt == "forward":
-                            # 内联 node 内部的 forward → Comp.Forward 引用，后续 _flatten_nodes_deep 处理
-                            inner.content.append(
-                                Comp.Forward(id=str(nd.get("id", "")))
-                            )
+                            # 完整保留嵌套 forward 段
+                            inner.content.append(_RawForward(nd))
                     content.append(inner)
 
             # 当前消息有内容（非全为已展开的嵌套转发）则作为独立节点
