@@ -31,10 +31,16 @@
         "default": true
       },
       "forward_nodes": {
-        "description": "合并转发消息的节点（推荐通过 /welcome set_forward 指令捕获，无需手动编辑）",
+        "description": "(旧版兼容) 合并转发消息节点",
         "type": "list",
         "default": [],
-        "hint": "⭐ 推荐用法：在群里发送一条合并转发，然后引用它发送 /welcome set_forward 即可自动捕获。也可手动填写 JSON。"
+        "hint": "已由 raw_messages 替代，此项保留用于旧数据兼容"
+      },
+      "raw_messages": {
+        "description": "合并转发原始数据（由 /welcome set_forward 自动填写，请勿手动编辑）",
+        "type": "list",
+        "default": [],
+        "hint": "存储 get_forward_msg API 返回的原始 messages 数组，发送时自动转换为标准格式"
       },
       "send_image": {
         "description": "是否发送图片",
