@@ -26,17 +26,21 @@ from astrbot.api import logger, AstrBotConfig
 # ── 原始 forward 段包装器：完整保留 NapCat data 结构 ────────────────
 
 class _RawForward(Comp.Forward):
-    """扩展 Comp.Forward，额外保存 NapCat 返回的完整 data 字典。
+    """扩展 Comp.Forward，保存 NapCat 返回的完整 data 字典。
     继承自 Comp.Forward（即 BaseMessageComponent），可安全放入 Node.content。
-    toDict() 输出 {"type":"forward","data":{...}}，由 Node.to_dict() 的
-    else 分支自动落入父级 content 数组，完整保留嵌套转发卡片。
+    toDict() 输出 {"type":"forward","data":{...}}，完整保留嵌套转发卡片。
+    通过 __dict__ 直接读写 _raw_data，绕过 Pydantic 的属性拦截。
     """
     def __init__(self, data: dict):
         super().__init__(id=str(data.get("id", "")))
-        self._data = data
+        self.__dict__["_raw_data"] = data
+
+    @property
+    def raw_data(self) -> dict:
+        return self.__dict__.get("_raw_data", {})
 
     def toDict(self) -> dict:
-        return {"type": "forward", "data": self._data}
+        return {"type": "forward", "data": self.raw_data}
 
 
 # ── 序列化 / 反序列化工具 ─────────────────────────────────────────────
@@ -61,7 +65,7 @@ def _serialize_component(comp) -> dict | None:
         return {"type": "at", "qq": str(getattr(comp, "qq", ""))}
     if isinstance(comp, _RawForward):
         # 完整保留原始 forward 段 data（不解构，不递归）
-        return {"type": "forward", "data": comp._data}
+        return {"type": "forward", "data": comp.raw_data}
     if isinstance(comp, Comp.Node):
         # 递归：嵌套的合并转发节点保留原结构
         return _serialize_node(comp)
