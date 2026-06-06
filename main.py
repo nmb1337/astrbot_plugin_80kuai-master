@@ -47,7 +47,9 @@ def _serialize_component(comp) -> dict | None:
     if isinstance(comp, Comp.At):
         return {"type": "at", "qq": str(getattr(comp, "qq", ""))}
     if isinstance(comp, (Comp.Node, Comp.Nodes, Comp.Forward)):
-        return {"type": "plain", "text": "[聊天记录]"}
+        # 不应出现：_flatten_nodes_deep 应已展开所有嵌套转发
+        logger.warning(f"[GroupWelcome] 序列化时遇到未展开的 {type(comp).__name__}，已跳过")
+        return None
     return {"type": "plain", "text": f"[{type(comp).__name__}]"}
 
 
@@ -93,20 +95,15 @@ async def _flatten_nodes_deep(
     """递归展开嵌套合并转发，将所有层级的消息平铺为单层 Node 列表。
 
     规则：
-    - 遍历每个 Node，检查其 content 中是否存在 Comp.Node/Comp.Nodes/Comp.Forward
-    - 若存在嵌套转发：
-        1. 保留当前 Node 中的非转发内容（纯文本/图片/表情等）
-        2. 递归展开嵌套的转发节点 → 得到子节点列表
-        3. 按顺序插入：当前 Node（仅含常规内容）→ 展开的子节点们
-    - 若当前 Node 的 content 全部是嵌套转发（无常规内容），则丢弃该 Node，
-      直接以展开的子节点替代（避免产生空消息）。
-    - 最大递归深度 5 层，防止无限循环。
-
-    返回完全扁平化的 Node 列表，其中任意 Node 的 content 均不含嵌套转发。
+    - 遍历每个 Node，检查其 content 中是否存在 Comp.Node / Comp.Nodes / Comp.Forward
+    - Comp.Node / Comp.Nodes → 递归展开子节点，插入到当前层级
+    - Comp.Forward → 尝试 _resolve_forward_ref 解析，失败则跳过（无占位文字）
+    - 若当前 Node 的 content 全是嵌套转发（无常规内容），则丢弃该 Node
+    - 最大递归深度 5 层
     """
     MAX_DEPTH = 5
     if depth > MAX_DEPTH:
-        logger.warning("[GroupWelcome] 达到最大嵌套深度，停止展开")
+        logger.warning("[GroupWelcome] _flatten_nodes_deep 达到最大深度")
         return nodes
 
     result: list[Comp.Node] = []
@@ -120,40 +117,40 @@ async def _flatten_nodes_deep(
             elif isinstance(comp, Comp.Nodes):
                 nested_nodes.extend(comp.nodes)
             elif isinstance(comp, Comp.Forward):
-                # 尝试通过 API 解析 Forward ID 引用
+                # 兜底：若仍有未解析的 Forward 引用，尝试解析
                 if bot:
                     resolved = await _resolve_forward_ref(bot, str(comp.id))
                     if resolved:
                         nested_nodes.extend(resolved)
                     else:
-                        regular.append(Comp.Plain(text="[聊天记录]"))
+                        logger.warning(
+                            f"[GroupWelcome] 无法解析 Forward id={comp.id}，已跳过"
+                        )
                 else:
-                    regular.append(Comp.Plain(text="[聊天记录]"))
+                    logger.warning(
+                        f"[GroupWelcome] 无 bot，跳过 Forward id={comp.id}"
+                    )
             else:
                 regular.append(comp)
 
-        # 递归展开嵌套节点
         if nested_nodes:
             expanded = await _flatten_nodes_deep(nested_nodes, bot, depth + 1)
             if regular:
-                # 当前节点有常规内容 → 保留（去除嵌套转发后的版本）
                 node.content = regular
                 result.append(node)
-            # 展开的嵌套节点跟在后面
             result.extend(expanded)
         else:
-            # 无嵌套转发，直接保留
             result.append(node)
 
     return result
 
 
 async def _resolve_forward_ref(bot, forward_id: str) -> list[Comp.Node]:
-    """通过 get_forward_msg API 解析 Forward ID 为 Node 列表。
-    嵌套 forward 段保留为 Comp.Forward 引用，由 _flatten_nodes_deep 下一轮递归处理。
+    """兜底：通过 get_forward_msg API 解析 Forward ID。
+    注意：NapCat 对内层（嵌套）转发返回 retcode=1200，此函数仅作最后兜底。
     """
     try:
-        logger.info(f"[GroupWelcome] 解析嵌套转发 id={forward_id}")
+        logger.info(f"[GroupWelcome] 兜底解析 Forward id={forward_id}")
         ret = await bot.call_action("get_forward_msg", message_id=forward_id)
         if ret and "messages" in ret:
             nodes = []
@@ -182,8 +179,11 @@ async def _resolve_forward_ref(bot, forward_id: str) -> list[Comp.Node]:
                 if content:
                     nodes.append(Comp.Node(uin=uin, name=name, content=content))
             return nodes
-    except Exception as e:
-        logger.error(f"[GroupWelcome] 解析嵌套转发失败 id={forward_id}: {e}")
+    except Exception:
+        # NapCat retcode=1200: 内层消息无法单独获取，静默跳过
+        logger.debug(
+            f"[GroupWelcome] 兜底解析 Forward id={forward_id} 失败（可能为内层消息）"
+        )
     return []
 
 
@@ -483,12 +483,14 @@ class GroupWelcomePlugin(Star):
         return []
 
     async def _fetch_forward_by_id(self, bot, forward_id: str) -> list[Comp.Node]:
-        """通过 get_forward_msg API 获取合并转发内容"""
+        """通过 get_forward_msg API 获取合并转发内容（含递归解析嵌套转发）"""
         try:
             logger.info(f"[GroupWelcome] 尝试 get_forward_msg, id={forward_id}")
             ret = await bot.call_action("get_forward_msg", message_id=forward_id)
             if ret and "messages" in ret:
-                nodes = self._parse_forward_api_response(ret["messages"])
+                nodes = await self._parse_forward_api_response(
+                    ret["messages"], bot=bot
+                )
                 logger.info(f"[GroupWelcome] get_forward_msg 返回 {len(nodes)} 个 Node")
                 return nodes
         except Exception as e:
@@ -507,22 +509,40 @@ class GroupWelcomePlugin(Star):
         return nodes
 
     @staticmethod
-    def _parse_forward_api_response(messages: list) -> list[Comp.Node]:
+    async def _parse_forward_api_response(
+        messages: list,
+        bot=None,
+        depth: int = 0,
+    ) -> list[Comp.Node]:
         """将 get_forward_msg API 返回的 messages 列表解析为 Node 列表。
-        嵌套的 forward 段保留为 Comp.Forward 引用，后续由 _flatten_nodes_deep 统一递归展开。
+
+        递归策略：
+        - text/image/face/at → 直接保留
+        - forward（嵌套转发）→ 立即调用 get_forward_msg 尝试解析内容
+          成功 → 递归解析内部消息，展开的子消息平铺到当前层级
+          失败（NapCat retcode=1200 内层消息）→ 静默跳过，不产生占位符
+        - node（内联节点）→ 解析为 Comp.Node，内部嵌套继续递归
         """
-        nodes = []
+        MAX_DEPTH = 5
+        if depth > MAX_DEPTH:
+            logger.warning("[GroupWelcome] _parse_forward_api_response 达到最大深度")
+            return []
+
+        nodes: list[Comp.Node] = []
         for msg in messages:
             sender = msg.get("sender", {})
             uin = str(sender.get("user_id", "0"))
             name = sender.get("nickname", "")
             raw_content = msg.get("message") or msg.get("content") or []
             content: list[Comp.BaseMessageComponent] = []
+
             for seg in raw_content:
                 seg_type = seg.get("type", "")
                 seg_data = seg.get("data", {})
+
                 if seg_type == "text":
                     content.append(Comp.Plain(text=seg_data.get("text", "")))
+
                 elif seg_type == "image":
                     url = seg_data.get("url", "")
                     file = seg_data.get("file", "")
@@ -530,15 +550,45 @@ class GroupWelcomePlugin(Star):
                         content.append(Comp.Image.fromURL(url))
                     elif file:
                         content.append(Comp.Image.fromFileSystem(file))
+
                 elif seg_type == "face":
                     content.append(Comp.Face(id=seg_data.get("id", 0)))
+
                 elif seg_type == "at":
                     content.append(Comp.At(qq=str(seg_data.get("qq", ""))))
+
                 elif seg_type == "forward":
-                    # 保留 Forward ID 引用，交由 _flatten_nodes_deep 递归解析
-                    content.append(Comp.Forward(id=str(seg_data.get("id", ""))))
+                    # ── 嵌套转发：尝试立即解析，展开子消息到当前层级 ──
+                    fid = seg_data.get("id", "")
+                    if fid and bot:
+                        logger.info(
+                            f"[GroupWelcome] 尝试解析嵌套转发 id={fid} (depth={depth})"
+                        )
+                        try:
+                            inner_ret = await bot.call_action(
+                                "get_forward_msg", message_id=str(fid)
+                            )
+                            if inner_ret and "messages" in inner_ret:
+                                inner_nodes = await GroupWelcomePlugin._parse_forward_api_response(
+                                    inner_ret["messages"], bot=bot, depth=depth + 1
+                                )
+                                # 将内层消息展开到当前层级（不嵌套，直接平铺）
+                                nodes.extend(inner_nodes)
+                        except Exception as e:
+                            # NapCat 对内层转发返回 retcode=1200，无法解析，静默跳过
+                            logger.warning(
+                                f"[GroupWelcome] 嵌套转发 id={fid} 无法解析（内层消息），已跳过"
+                            )
+                            logger.debug(f"[GroupWelcome] 详情: {e}")
+                    elif fid:
+                        # 无 bot 引用，无法解析，跳过
+                        logger.warning(
+                            f"[GroupWelcome] 无 bot 无法解析嵌套转发 id={fid}，已跳过"
+                        )
+                    # 注意：无论成功与否，都不添加占位文字到 content
+
                 elif seg_type == "node":
-                    # 内联 node 类型：先解析为简单 Node，嵌套转发由 _flatten_nodes_deep 处理
+                    # ── 内联 node：递归解析其 content ──
                     inner = Comp.Node(
                         uin=str(seg_data.get("user_id", "0")),
                         name=seg_data.get("nickname", ""),
@@ -551,7 +601,8 @@ class GroupWelcomePlugin(Star):
                             inner.content.append(Comp.Plain(text=nd.get("text", "")))
                         elif nt == "image":
                             inner.content.append(
-                                Comp.Image.fromURL(nd["url"]) if nd.get("url", "").startswith("http")
+                                Comp.Image.fromURL(nd["url"])
+                                if nd.get("url", "").startswith("http")
                                 else Comp.Image.fromFileSystem(nd.get("file", ""))
                             )
                         elif nt == "face":
@@ -559,10 +610,16 @@ class GroupWelcomePlugin(Star):
                         elif nt == "at":
                             inner.content.append(Comp.At(qq=str(nd.get("qq", ""))))
                         elif nt == "forward":
-                            inner.content.append(Comp.Forward(id=str(nd.get("id", ""))))
+                            # 内联 node 内部的 forward → Comp.Forward 引用，后续 _flatten_nodes_deep 处理
+                            inner.content.append(
+                                Comp.Forward(id=str(nd.get("id", "")))
+                            )
                     content.append(inner)
+
+            # 当前消息有内容（非全为已展开的嵌套转发）则作为独立节点
             if content:
                 nodes.append(Comp.Node(uin=uin, name=name, content=content))
+
         return nodes
 
     async def _send_group_card(self, bot, user_id: str, group_id: str, wc: dict):
