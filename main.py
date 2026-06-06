@@ -262,15 +262,21 @@ class GroupWelcomePlugin(Star):
             return
         try:
             messages = _convert_raw_to_send_format(raw_msgs)
-            logger.info(f"[GroupWelcome] 准备发送 {len(messages)} 条消息，首条 sample: {str(messages[0])[:300] if messages else 'empty'}")
+            logger.info(f"[GroupWelcome] 准备发送 {len(messages)} 条消息")
             try:
                 await bot.call_action("send_private_forward_msg", user_id=user_id, group_id=group_id, messages=messages)
-            except Exception:
+            except Exception as e1:
+                logger.warning(f"[GroupWelcome] 带 group_id 发送失败: {e1}")
+                # 尝试不带 group_id
                 await bot.call_action("send_private_forward_msg", user_id=user_id, messages=messages)
             logger.info(f"[GroupWelcome] 合并转发已发送 -> {user_id}")
         except Exception as e:
+            # 捕获 ActionFailed 的详细信息
+            extra = ""
+            if hasattr(e, 'result'):
+                extra = f" | NapCat result: {e.result}"
             import traceback
-            logger.error(f"[GroupWelcome] 发送合并转发失败: {e}\n{traceback.format_exc()}")
+            logger.error(f"[GroupWelcome] 发送合并转发失败: {e}{extra}\n{traceback.format_exc()}")
 
     async def _send_group_card(self, bot, user_id: str, group_id: str, wc: dict):
         try:
