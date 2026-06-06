@@ -558,16 +558,21 @@ class GroupWelcomePlugin(Star):
                     content.append(Comp.At(qq=str(seg_data.get("qq", ""))))
 
                 elif seg_type == "forward":
-                    # ── 嵌套转发：尝试立即解析，展开子消息到当前层级 ──
+                    # ── 嵌套转发：优先使用 NapCat 内联 content/messages，否则 API 兜底 ──
                     fid = seg_data.get("id", "")
-                    # 调试：打印 data 的全部 key，检查是否有内联内容
-                    logger.info(
-                        f"[GroupWelcome] 嵌套转发 id={fid}, "
-                        f"data_keys={list(seg_data.keys())}, "
-                        f"depth={depth}"
-                    )
-                    resolved = False
-                    if fid and bot:
+                    # NapCat/LLOneBot 在 data.content 或 data.messages 中内联展开嵌套消息
+                    inline_msgs = seg_data.get("content") or seg_data.get("messages")
+
+                    if inline_msgs and isinstance(inline_msgs, list):
+                        logger.info(
+                            f"[GroupWelcome] 嵌套转发 id={fid} 使用内联数据 "
+                            f"({len(inline_msgs)} 条消息)"
+                        )
+                        inner_nodes = await GroupWelcomePlugin._parse_forward_api_response(
+                            inline_msgs, bot=bot, depth=depth + 1
+                        )
+                        nodes.extend(inner_nodes)
+                    elif fid and bot:
                         try:
                             inner_ret = await bot.call_action(
                                 "get_forward_msg", message_id=str(fid)
@@ -577,13 +582,13 @@ class GroupWelcomePlugin(Star):
                                     inner_ret["messages"], bot=bot, depth=depth + 1
                                 )
                                 nodes.extend(inner_nodes)
-                                resolved = True
                         except Exception:
-                            pass  # NapCat retcode=1200，内层消息无法单独获取
-                    if not resolved:
+                            logger.warning(
+                                f"[GroupWelcome] 嵌套转发 id={fid} API 解析失败，已跳过"
+                            )
+                    else:
                         logger.warning(
-                            f"[GroupWelcome] 嵌套转发 id={fid} 无法解析（NapCat 不支持内层消息），"
-                            f"data_keys={list(seg_data.keys())}，已跳过"
+                            f"[GroupWelcome] 嵌套转发 id={fid} 无内联数据且无 bot，已跳过"
                         )
 
                 elif seg_type == "node":
