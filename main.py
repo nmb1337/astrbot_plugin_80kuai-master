@@ -59,6 +59,13 @@ def _convert_content_segments(segments: list) -> list:
                     "content": _convert_content_segments(data.get("content") or []),
                 },
             })
+        elif t in ("image", "video", "record"):
+            # 媒体段：get_forward_msg 返回的 file 是文件名，需替换为可下载 URL
+            d = dict(seg.get("data", {}))
+            url = d.get("url", "")
+            if url and url.startswith("http"):
+                d["file"] = url  # NapCat send 格式要求 file 为 URL
+            out.append({"type": t, "data": d})
         else:
             out.append(copy.deepcopy(seg))
     return out
