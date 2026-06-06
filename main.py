@@ -26,10 +26,7 @@ from astrbot.api import logger, AstrBotConfig
 # ── 序列化 / 反序列化工具 ─────────────────────────────────────────────
 
 def _serialize_component(comp) -> dict | None:
-    """将单个消息组件序列化为可 JSON 存储的 dict。
-    注意：调用前所有嵌套 Node/Nodes 必须已被 _flatten_nodes_deep 展开，
-    因此此处遇到 Node/Nodes/Forward 仅作兜底占位。
-    """
+    """将单个消息组件序列化为可 JSON 存储的 dict（支持递归嵌套 Node/Nodes）"""
     if isinstance(comp, Comp.Plain):
         return {"type": "plain", "text": comp.text or ""}
     if isinstance(comp, Comp.Image):
@@ -46,15 +43,22 @@ def _serialize_component(comp) -> dict | None:
         return {"type": "face", "id": getattr(comp, "id", 0)}
     if isinstance(comp, Comp.At):
         return {"type": "at", "qq": str(getattr(comp, "qq", ""))}
-    if isinstance(comp, (Comp.Node, Comp.Nodes, Comp.Forward)):
-        # 不应出现：_flatten_nodes_deep 应已展开所有嵌套转发
-        logger.warning(f"[GroupWelcome] 序列化时遇到未展开的 {type(comp).__name__}，已跳过")
-        return None
+    if isinstance(comp, Comp.Node):
+        # 递归：嵌套的合并转发节点保留原结构
+        return _serialize_node(comp)
+    if isinstance(comp, Comp.Nodes):
+        # 递归：嵌套的合并转发消息组
+        return {
+            "type": "nodes",
+            "nodes": [_serialize_node(n) for n in comp.nodes],
+        }
+    if isinstance(comp, Comp.Forward):
+        return {"type": "forward_ref", "id": str(getattr(comp, "id", ""))}
     return {"type": "plain", "text": f"[{type(comp).__name__}]"}
 
 
 def _deserialize_component(data: dict) -> Comp.BaseMessageComponent:
-    """从存储的 dict 还原消息组件（不支持嵌套，因为已扁平化）"""
+    """从存储的 dict 还原消息组件（支持递归嵌套 Node/Nodes）"""
     t = data.get("type", "plain")
     if t == "plain":
         return Comp.Plain(text=data.get("text", ""))
@@ -70,6 +74,15 @@ def _deserialize_component(data: dict) -> Comp.BaseMessageComponent:
         return Comp.Face(id=data.get("id", 0))
     if t == "at":
         return Comp.At(qq=data.get("qq", ""))
+    if t == "node":
+        # 递归：还原嵌套的合并转发节点
+        return _deserialize_node(data)
+    if t == "nodes":
+        # 递归：还原嵌套的合并转发消息组
+        nodes = [_deserialize_node(n) for n in data.get("nodes", [])]
+        return Comp.Nodes(nodes=nodes)
+    if t == "forward_ref":
+        return Comp.Plain(text="[聊天记录]")
     return Comp.Plain(text=data.get("text", "[未知消息]"))
 
 
@@ -254,7 +267,6 @@ class GroupWelcomePlugin(Star):
             AiocqhttpMessageEvent,
         )
         bot = event.bot if isinstance(event, AiocqhttpMessageEvent) else None
-        nodes = await _flatten_nodes_deep(nodes, bot)
         stored = [_serialize_node(n) for n in nodes]
         wc = self.config.get("welcome_config", {})
         wc["forward_nodes"] = stored
@@ -558,20 +570,20 @@ class GroupWelcomePlugin(Star):
                     content.append(Comp.At(qq=str(seg_data.get("qq", ""))))
 
                 elif seg_type == "forward":
-                    # ── 嵌套转发：优先使用 NapCat 内联 content/messages，否则 API 兜底 ──
+                    # ── 嵌套转发：保留原结构，不解构、不扁平化 ──
                     fid = seg_data.get("id", "")
-                    # NapCat/LLOneBot 在 data.content 或 data.messages 中内联展开嵌套消息
                     inline_msgs = seg_data.get("content") or seg_data.get("messages")
 
                     if inline_msgs and isinstance(inline_msgs, list):
                         logger.info(
-                            f"[GroupWelcome] 嵌套转发 id={fid} 使用内联数据 "
+                            f"[GroupWelcome] 嵌套转发 id={fid} 保留嵌套结构 "
                             f"({len(inline_msgs)} 条消息)"
                         )
                         inner_nodes = await GroupWelcomePlugin._parse_forward_api_response(
                             inline_msgs, bot=bot, depth=depth + 1
                         )
-                        nodes.extend(inner_nodes)
+                        # 每个内层节点作为独立 Comp.Node 加入父节点 content
+                        content.extend(inner_nodes)
                     elif fid and bot:
                         try:
                             inner_ret = await bot.call_action(
@@ -581,7 +593,7 @@ class GroupWelcomePlugin(Star):
                                 inner_nodes = await GroupWelcomePlugin._parse_forward_api_response(
                                     inner_ret["messages"], bot=bot, depth=depth + 1
                                 )
-                                nodes.extend(inner_nodes)
+                                content.extend(inner_nodes)
                         except Exception:
                             logger.warning(
                                 f"[GroupWelcome] 嵌套转发 id={fid} API 解析失败，已跳过"
