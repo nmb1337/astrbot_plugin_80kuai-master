@@ -68,8 +68,11 @@ def _convert_content_segments(segments: list) -> list:
             elif d.get("file", "").startswith("http"):
                 out.append({"type": t, "data": d})
             else:
+                # NapCat 已知限制 (issue #818)：合并转发中的视频/语音无下载 URL
                 label = {"image": "[图片]", "video": "[视频]", "record": "[语音]"}.get(t, f"[{t}]")
-                logger.warning(f"[GroupWelcome] {t} 无有效URL，降级为文本")
+                logger.info(
+                    f"[GroupWelcome] {t} 无有效URL (NapCat 限制: 合并转发中的视频无法获取下载链接)，保留为文本"
+                )
                 out.append({"type": "text", "data": {"text": label}})
         elif t == "file":
             d = seg.get("data", {})
@@ -261,10 +264,44 @@ class GroupWelcomePlugin(Star):
             ret = await bot.call_action("get_forward_msg", message_id=forward_id)
             if ret and "messages" in ret:
                 logger.info(f"[GroupWelcome] 获取到 {len(ret['messages'])} 条原始消息")
+                # 尝试通过 get_file API 解析视频/语音的下载 URL
+                await self._resolve_media_urls(bot, ret["messages"])
                 return ret["messages"]
         except Exception as e:
             logger.error(f"[GroupWelcome] get_forward_msg 失败: {e}")
         return None
+
+    async def _resolve_media_urls(self, bot, messages: list, depth: int = 0):
+        """递归遍历 messages，对无 HTTP URL 的视频/语音尝试 get_file 获取下载链接"""
+        if depth > 5:
+            return
+        for msg in messages:
+            segs = msg.get("message") or msg.get("content") or []
+            for seg in segs:
+                t = seg.get("type", "")
+                d = seg.get("data", {})
+                if t in ("video", "record"):
+                    url = d.get("url", "")
+                    file = d.get("file", "")
+                    if not url.startswith("http") and not file.startswith("http") and file:
+                        # 尝试通过 NapCat get_file API 获取下载 URL
+                        try:
+                            logger.info(f"[GroupWelcome] 尝试 get_file 解析 {t}: file={file}")
+                            fr = await bot.call_action("get_file", file=file)
+                            if fr and "url" in fr:
+                                d["url"] = fr["url"]
+                                d["file"] = fr["url"]
+                                logger.info(f"[GroupWelcome] get_file 成功: {fr['url'][:80]}")
+                        except Exception as e:
+                            logger.info(f"[GroupWelcome] get_file 失败 (NapCat 限制): {e}")
+                elif t == "forward":
+                    inline = d.get("content") or []
+                    if inline:
+                        await self._resolve_media_urls(bot, inline, depth + 1)
+                elif t == "node":
+                    inner = d.get("content") or []
+                    if inner:
+                        await self._resolve_media_urls(bot, [{"message": inner}], depth + 1)
 
     # ── 发送 ──────────────────────────────────────────────────────
 
